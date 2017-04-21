@@ -7,6 +7,7 @@
 #include <cassert>
 #include <algorithm>
 #include <thread>
+#include <condition_variable>
 
 #include "overlap.h"
 #include "../common/config.h"
@@ -87,12 +88,6 @@ bool OverlapDetector::overlapTest(const OverlapRange& ovlp) const
 
 namespace
 {
-	struct DPRecord
-	{
-		OverlapRange ovlp;
-		std::vector<int32_t> shifts;
-	};
-	
 	template<typename T>
 	T median(std::vector<T>& vec)
 	{
@@ -105,117 +100,135 @@ namespace
 	}
 }
 
+
+void OverlapDetector::
+	processKmer(const VertexIndex::ReadPosition& extReadPos,
+				std::vector<OverlapDetector::DPRecord>& extPaths,
+				int32_t curPos, const FastaRecord& fastaRec) const
+ {
+	//no trivial matches
+	if (extReadPos.readId == fastaRec.id &&
+		extReadPos.position == curPos) return;
+
+	size_t extLen = _seqContainer.seqLen(extReadPos.readId);
+	size_t curLen = fastaRec.sequence.length();
+	int32_t extPos = extReadPos.position;
+	if (extLen < (size_t)_minOverlap) return;
+
+	size_t maxCloseId = 0;
+	size_t maxFarId = 0;
+	int32_t maxCloseLen = 0;
+	int32_t maxFarLen = 0;
+	bool extendsClose = false;
+	bool extendsFar = false;
+
+	//searching for longest possible extension
+	for (size_t pathId = 0; pathId < extPaths.size(); ++pathId)
+	{
+		JumpRes jumpResult = 
+			this->jumpTest(extPaths[pathId].ovlp.curEnd, curPos,
+						   extPaths[pathId].ovlp.extEnd, extPos);
+		int32_t jumpLength = curPos - extPaths[pathId].ovlp.curBegin;
+
+		switch (jumpResult)
+		{
+			case J_END:
+				break;
+			case J_INCONS:
+				break;
+			case J_CLOSE:
+				extPaths[pathId].deleted = true;
+				if (jumpLength > maxCloseLen)
+				{
+					extendsClose = true;
+					maxCloseId = pathId;	
+					maxCloseLen = jumpLength;
+				}
+				break;
+			case J_FAR:
+				if (jumpLength > maxFarLen)
+				{
+					extendsFar = true;
+					maxFarId = pathId;
+					maxFarLen = jumpLength;
+				}
+				break;
+		}
+	}
+	//update the best close extension
+	if (extendsClose)
+	{
+		extPaths[maxCloseId].deleted = false;
+		extPaths[maxCloseId].ovlp.curEnd = curPos;
+		extPaths[maxCloseId].ovlp.extEnd = extPos;
+		extPaths[maxCloseId].shifts.push_back(curPos - extPos);
+	}
+	//update the best far extension, keep the old path as a copy
+	if (extendsFar)
+	{
+		extPaths.push_back(extPaths[maxFarId]);
+		extPaths.back().ovlp.curEnd = curPos;
+		extPaths.back().ovlp.extEnd = extPos;
+		extPaths.back().shifts.push_back(curPos - extPos);
+	}
+	//if no extensions possible (or there are no active paths), start a new path
+	if (!extendsClose && !extendsFar &&
+		(this->goodStart(curPos, extPos, curLen, extLen) ||
+		fastaRec.id == extReadPos.readId.rc()))	//TODO: temporary bypass overhang
+	{
+		OverlapRange ovlp(fastaRec.id, extReadPos.readId,
+						  curPos, extPos, curLen, extLen);
+		extPaths.push_back({ovlp, {}, false});
+	}
+	//cleaning up
+	for (int i = (int)extPaths.size() - 1; i >= 0; --i)
+	{
+		if (extPaths[i].deleted)
+		{
+			extPaths[i] = extPaths.back();
+			extPaths.pop_back();
+		}
+	}
+
+ }
+
 std::vector<OverlapRange> 
 OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec, 
-								bool uniqueExtensions) const
+								bool uniqueExtensions)
 {
 	std::unordered_map<FastaRecord::Id, 
 					   std::vector<DPRecord>> activePaths;
-	std::set<size_t> eraseMarks;
-	size_t curLen = fastaRec.sequence.length();
 
 	//for all kmers in this read
 	for (auto curKmerPos : IterKmers(fastaRec.sequence))
 	{
 		if (!_vertexIndex.isSolid(curKmerPos.kmer)) continue;
 
-		int32_t curPos = curKmerPos.position;
-
 		//for all other occurences of this kmer (extension candidates)
-		for (const auto& extReadPos : _vertexIndex.byKmer(curKmerPos.kmer))
+		while (_numberRunning > 0) std::this_thread::yield();
+
+		_kmersQueue.clear();
+		_pathsQueue.clear();
+		_nextJobId = 0;
+		_curPos = curKmerPos.position;
+		_curFasta = fastaRec;
+		FastaRecord::Id prevReadId = FastaRecord::ID_NONE;
+		for (auto extKmerPos : _vertexIndex.byKmer(curKmerPos.kmer))
 		{
-			/*if (_vertexIndex.isRepetitive(curKmerPos.kmer) &&
-				!activePaths.count(extReadPos.readId))
+			if (extKmerPos.readId != prevReadId)
 			{
-				continue;
-			}*/
-
-			//no trivial matches
-			if (extReadPos.readId == fastaRec.id &&
-				extReadPos.position == curPos) continue;
-
-			size_t extLen = _seqContainer.seqLen(extReadPos.readId);
-			if (extLen < (size_t)_minOverlap) continue;
-
-			int32_t extPos = extReadPos.position;
-			auto& extPaths = activePaths[extReadPos.readId];
-
-			size_t maxCloseId = 0;
-			size_t maxFarId = 0;
-			int32_t maxCloseLen = 0;
-			int32_t maxFarLen = 0;
-			bool extendsClose = false;
-			bool extendsFar = false;
-			eraseMarks.clear();
-
-			//searching for longest possible extension
-			for (size_t pathId = 0; pathId < extPaths.size(); ++pathId)
-			{
-				JumpRes jumpResult = 
-					this->jumpTest(extPaths[pathId].ovlp.curEnd, curPos,
-								   extPaths[pathId].ovlp.extEnd, extPos);
-				int32_t jumpLength = curPos - extPaths[pathId].ovlp.curBegin;
-
-				switch (jumpResult)
-				{
-					case J_END:
-						break;
-					case J_INCONS:
-						break;
-					case J_CLOSE:
-						eraseMarks.insert(pathId);
-						if (jumpLength > maxCloseLen)
-						{
-							extendsClose = true;
-							maxCloseId = pathId;	
-							maxCloseLen = jumpLength;
-						}
-						break;
-					case J_FAR:
-						if (jumpLength > maxFarLen)
-						{
-							extendsFar = true;
-							maxFarId = pathId;
-							maxFarLen = jumpLength;
-						}
-						break;
-				}
+				activePaths[extKmerPos.readId];
+				_kmersQueue.push_back(extKmerPos);
+				_pathsQueue.push_back(&activePaths[extKmerPos.readId]);
+				prevReadId = extKmerPos.readId;
 			}
-			//update the best close extension
-			if (extendsClose)
-			{
-				eraseMarks.erase(maxCloseId);
-				extPaths[maxCloseId].ovlp.curEnd = curPos;
-				extPaths[maxCloseId].ovlp.extEnd = extPos;
-				extPaths[maxCloseId].shifts.push_back(curPos - extPos);
-			}
-			//update the best far extension, keep the old path as a copy
-			if (extendsFar)
-			{
-				extPaths.push_back(extPaths[maxFarId]);
-				extPaths.back().ovlp.curEnd = curPos;
-				extPaths.back().ovlp.extEnd = extPos;
-				extPaths.back().shifts.push_back(curPos - extPos);
-			}
-			//if no extensions possible (or there are no active paths), start a new path
-			if (!extendsClose && !extendsFar &&
-				(this->goodStart(curPos, extPos, curLen, extLen) ||
-				fastaRec.id == extReadPos.readId.rc()))	//TODO: temporary bypass overhang
-			{
-				OverlapRange ovlp(fastaRec.id, extReadPos.readId,
-								  curPos, extPos, curLen, extLen);
-				extPaths.push_back({ovlp});
-			}
-			//cleaning up
-			for (auto itEraseId = eraseMarks.rbegin(); 
-				 itEraseId != eraseMarks.rend(); ++itEraseId)
-			{
-				extPaths[*itEraseId] = extPaths.back();
-				extPaths.pop_back();
-			}
-		} //end loop over kmer occurences in other reads
-	} //end loop over kmers in the current read
-	
+		}
+
+		_workersPaused = false;
+		while (!_workersPaused) std::this_thread::yield();
+	}
+
+	//post-processing
 	std::vector<OverlapRange> detectedOverlaps;
 	for (auto& ap : activePaths)
 	{
@@ -227,7 +240,7 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 			if (this->overlapTest(dpRec.ovlp))
 			{
 				dpRec.ovlp.leftShift = median(dpRec.shifts);
-				dpRec.ovlp.rightShift = extLen - curLen + 
+				dpRec.ovlp.rightShift = extLen - fastaRec.sequence.length() + 
 										dpRec.ovlp.leftShift;
 
 				if (!uniqueExtensions)
@@ -251,7 +264,41 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 	}
 
 	return detectedOverlaps;
+}
 
+void OverlapDetector::threadWorker()
+{
+	bool isRunning = false;
+	while (true)
+	{
+		while (_workersPaused) 
+		{
+			if (isRunning)
+			{
+				isRunning = false;
+				_numberRunning -= 1;
+			}
+			std::this_thread::yield();
+		}
+		if (!isRunning)
+		{
+			isRunning = true;
+			_numberRunning += 1;
+		}
+
+		if (_threadsExit) return;
+		size_t expected = _nextJobId;
+		if (expected == _kmersQueue.size()) 
+		{
+			_workersPaused = true;
+			continue;
+		}
+		if (_nextJobId.compare_exchange_weak(expected, expected + 1))
+		{
+			processKmer(_kmersQueue[expected], *_pathsQueue[expected], 
+						_curPos, _curFasta);
+		}
+	}
 }
 
 const std::vector<OverlapRange>&

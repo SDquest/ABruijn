@@ -20,6 +20,8 @@ struct FastaRecord
 			{return _id == other._id;}
 		bool operator!=(const Id& other) const
 			{return !(*this == other);}
+		bool operator<(const Id& other) const
+			{return _id < other._id;}
 
 		Id rc() const		//reverse complement 
 			{return Id(_id + 1 - (_id % 2) * 2);}

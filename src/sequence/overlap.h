@@ -14,6 +14,7 @@
 #include "sequence_container.h"
 #include "../common/logger.h"
 #include "../common/progress_bar.h"
+#include "../common/config.h"
 
 
 struct OverlapRange
@@ -130,15 +131,49 @@ public:
 		_minOverlap(minOverlap),
 		_maxOverhang(maxOverhang),
 		_checkOverhang(maxOverhang > 0),
+		_workersPaused(true),
+		_threadsExit(false),
+		_numberRunning(0),
+		_nextJobId(0),
+		_threads(Parameters::get().numThreads),
 		_vertexIndex(vertexIndex),
 		_seqContainer(seqContainer)
-	{}
+	{
+		for (size_t i = 0; i < _threads.size(); ++i)
+		{
+			_threads[i] = std::thread([this](){this->threadWorker();});
+		}
+	}
+
+	~OverlapDetector()
+	{
+		while (_numberRunning > 0) std::this_thread::yield();
+
+		_threadsExit = true;
+		_workersPaused = false;
+		for (size_t i = 0; i < _threads.size(); ++i)
+		{
+			_threads[i].join();
+		}
+	}
 
 	std::vector<OverlapRange> 
-	getSeqOverlaps(const FastaRecord& fastaRec, bool uniqueExtensions) const;
+	getSeqOverlaps(const FastaRecord& fastaRec, bool uniqueExtensions);
 
 private:
 	enum JumpRes {J_END, J_INCONS, J_CLOSE, J_FAR};
+
+	struct DPRecord
+	{
+		OverlapRange ovlp;
+		std::vector<int32_t> shifts;
+		bool deleted;
+	};
+
+	void threadWorker();
+	void processKmer(const VertexIndex::ReadPosition& extReadPos,
+					 std::vector<DPRecord>& extPaths, 
+					 int32_t curPos, const FastaRecord& fastaRec) const;
 
 	
 	bool    goodStart(int32_t currentPos, int32_t extensionPos, 
@@ -152,6 +187,20 @@ private:
 	const int _maxOverhang;
 	const bool _checkOverhang;
 
+	//parallel running features
+	std::atomic<bool> _workersPaused;
+	std::atomic<bool> _threadsExit;
+	std::atomic<int> _numberRunning;
+	std::atomic<size_t> _nextJobId;
+	std::vector<std::thread> _threads;
+
+	std::vector<VertexIndex::ReadPosition> _kmersQueue;
+	std::vector<std::vector<DPRecord>*> _pathsQueue;
+	int32_t _curPos;
+	FastaRecord _curFasta;
+
+	//
+
 	const VertexIndex& _vertexIndex;
 	const SequenceContainer& _seqContainer;
 };
@@ -160,7 +209,7 @@ private:
 class OverlapContainer
 {
 public:
-	OverlapContainer(const OverlapDetector& ovlpDetect,
+	OverlapContainer(OverlapDetector& ovlpDetect,
 					 const SequenceContainer& queryContainer,
 					 bool onlyMax):
 		_ovlpDetect(ovlpDetect),
@@ -183,7 +232,7 @@ private:
 					   FastaRecord::Id seqId);
 	void filterOverlaps();
 
-	const OverlapDetector& _ovlpDetect;
+	OverlapDetector& _ovlpDetect;
 	const SequenceContainer& _queryContainer;
 	const bool _onlyMax;
 

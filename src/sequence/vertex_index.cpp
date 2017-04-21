@@ -126,6 +126,15 @@ void VertexIndex::buildIndex(int minCoverage, int maxCoverage, int filterRatio)
 	processInParallel(allReads, indexUpdate, 
 					  Parameters::get().numThreads, true);
 
+	//sorting by read and position
+	for (auto kmerHash : _kmerIndex.lock_table())
+	{
+		std::sort(kmerHash.second->begin(), kmerHash.second->end(),
+				  [](const ReadPosition& rp1, const ReadPosition& rp2)
+				  	{return (rp1.readId != rp2.readId) ? rp1.readId < rp2.readId : 
+					 		rp1.position < rp2.position;});
+	}
+
 	_kmerCounts.clear();
 	_kmerCounts.reserve(0);
 }
